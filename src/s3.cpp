@@ -10,6 +10,7 @@
 #include "capnp/compat/byte-stream.h"
 
 #include <kj/io.h>
+#include <kj/compat/url.h>
 #include <kj/debug.h>
 #include <kj/encoding.h>
 #include <kj/refcount.h>
@@ -35,6 +36,7 @@ capnp::ByteStream::Client multipart(
   
 struct ObjectServer
   : S3::Object::Server
+  , kj::Refcounted
   , kj::TaskSet::ErrorHandler {
 
   ObjectServer(
@@ -45,6 +47,10 @@ struct ObjectServer
     , key_{kj::str(key)} {
   }
 
+  kj::Own<ObjectServer> addRef() {
+    return kj::addRef(*this);
+  }
+
   void taskFailed(kj::Exception&& exc) override {
     KJ_LOG(ERROR, exc);
   }
@@ -53,6 +59,7 @@ struct ObjectServer
   kj::Promise<void> getBucket(GetBucketContext) override;
   kj::Promise<void> read(ReadContext) override;
   kj::Promise<void> write(WriteContext) override;
+  kj::Promise<void> multipart(MultipartContext) override;
   kj::Promise<void> versions(VersionsContext) override;
 
   kj::TaskSet tasks_;
@@ -72,244 +79,17 @@ struct BucketServer
 
   kj::Promise<void> getObject(GetObjectContext) override;
 
+  kj::String getPath() const {
+    return kj::str("https://", name_, "s3.amazonaws.com");
+  }
+
+  kj::HttpHeaderTable responseTable_;
   kj::Own<S3Server> s3_;
   kj::String name_;
   kj::String hostname_;
+  kj::Url url_;
   kj::HttpHeaders headers_;
 };
-
-struct S3Server
-  : S3::Server
-  , kj::Refcounted
-  , kj::TaskSet::ErrorHandler {
-
-  S3Server(
-    kj::HttpHeaderTable::Builder& builder,
-    kj::Own<kj::HttpClient> awsService,
-    kj::StringPtr region,
-    kj::Maybe<capnp::ByteStreamFactory&> = nullptr
-  );
-
-  kj::Own<S3Server> addRef() {
-    return kj::addRef(*this);
-  }
-  
-  void taskFailed(kj::Exception&& exc) override {
-    KJ_LOG(ERROR, exc);
-  }
-
-  kj::Promise<void> list(ListContext) override;
-  kj::Promise<void> getBucket(GetBucketContext) override;
-
-  struct {
-    kj::HttpHeaderId etag;
-    kj::HttpHeaderId range;
-  } ids_;
-
-  
-  kj::TaskSet tasks_;
-  kj::Own<kj::HttpClient> awsService_;
-  kj::HttpHeaderTable& table_;
-  kj::StringPtr region_;
-  kj::String hostname_;
-
-  kj::Own<capnp::ByteStreamFactory> factory_;
-};
-
-S3Server::S3Server(
-  kj::HttpHeaderTable::Builder& builder,
-  kj::Own<kj::HttpClient> awsService,
-  kj::StringPtr region,
-  kj::Maybe<capnp::ByteStreamFactory&> factory)
-  : tasks_{*this}
-  , awsService_{kj::mv(awsService)}
-  , ids_{ 
-      .etag{builder.add("etag")},
-      .range{builder.add("range")}
-  }
-  , table_{builder.getFutureTable()}
-  , region_{region}
-  , hostname_{kj::str("s3."_kj, region_, ".amazonaws.com")} {
-
-  KJ_IF_MAYBE(f, factory) {
-    factory_ = kj::Own<capnp::ByteStreamFactory>(f, kj::NullDisposer::instance);
-  }
-}
-
-kj::Promise<void> S3Server::list(ListContext ctx) {
-
-  KJ_DREQUIRE(headerTable_.isReady());
-
-  auto url = kj::str("https://"_kj, hostname_, "/"_kj);
-
-  kj::HttpHeaders headers{table_};
-  headers.set(kj::HttpHeaderId::HOST, hostname_);
-  auto req = awsService_->request(kj::HttpMethod::GET, url, headers);
-
-  auto params = ctx.getParams();
-  auto callback = params.getCallback();
-
-  return
-    req.response
-    .then(
-      [this](auto response) mutable {
-	return response.body->readAllText().attach(kj::mv(response.body));
-      }
-    )
-    .then(
-      [callback](auto txt) mutable {
-
-	kj::Vector<kj::Promise<void>> promises;
-
-	rapidxml::xml_document<> doc;
-	doc.parse<rapidxml::parse_non_destructive>(const_cast<char*>(txt.cStr()));
-
-	auto first_node = [](auto node, auto name) {
-	  return node->first_node(name.begin(), name.size());
-	};
-
-	auto next_sibling = [](auto node, auto name) {
-	  return node->next_sibling(name.begin(), name.size());
-	};
-
-	auto result = first_node(&doc, "ListAllMyBucketsResult"_kj);
-	result = first_node(result, "Buckets"_kj);
-	result = first_node(result, "Bucket"_kj);
-
-	while (result) {
-	  auto name = first_node(result, "Name"_kj);
-	  auto value = kj::StringPtr{name->value(), name->value_size()};
-	  auto req = callback.nextRequest();
-	  req.setValue(value);
-	  promises.add(req.send().ignoreResult());
-	  result = next_sibling(result, "Bucket"_kj);
-	}
-
-	return kj::joinPromises(promises.releaseAsArray());
-      }
-    )
-    .then(
-      [callback]() mutable {
-	auto req = callback.endRequest();
-	return req.send().ignoreResult();
-      }
-    );
-}
-
-kj::Promise<void> S3Server::getBucket(GetBucketContext ctx) {
-  auto params = ctx.getParams();
-  auto name = params.getName();
-  auto reply = ctx.getResults();
-  reply.setBucket(kj::refcounted<BucketServer>(addRef(), name, region_));
-  return kj::READY_NOW;
-}
-  
-BucketServer::BucketServer(kj::Own<S3Server> s3, kj::StringPtr name, kj::StringPtr region)
-  : s3_{kj::mv(s3)}
-  , name_{kj::str(name)}
-  , hostname_{kj::str(name_, ".s3.", region, ".amazonaws.com")}
-  , headers_{s3_->table_} {
-
-  headers_.set(kj::HttpHeaderId::HOST, hostname_);
-}
-
-kj::Promise<void> BucketServer::getObject(GetObjectContext ctx) {
-  auto params = ctx.getParams();
-  auto key = params.getKey();
-  auto reply = ctx.getResults();
-  reply.setObject(kj::heap<ObjectServer>(addRef(), key));
-  return kj::READY_NOW;
-}
-
-kj::Promise<void> ObjectServer::head(HeadContext ctx) {
-  auto url = kj::str("https://"_kj, bucket_->hostname_, "/"_kj, key_);
-
-  auto req = bucket_->s3_->awsService_->request(
-    kj::HttpMethod::HEAD, url, bucket_->headers_, 0ul
-  );
-
-  return
-    req.response
-    .then(
-      [this, ctx = kj::mv(ctx)](auto response) mutable {
-	auto reply = ctx.getResults();
-	reply.setKey(key_);
-	KJ_LOG(INFO, response.statusText);
-
-	auto headers = reply.initHeaders(response.headers->size());
-	auto ii = 0u;
-	response.headers->forEach(
-          [&](auto name, auto value) {
-	    auto header = headers[ii++].initUncommon();
-	    header.setName(name);
-	    header.setValue(value);
-	    KJ_LOG(INFO, name, value);
-	  }
-	);
-      }
-    );
-}
-
-kj::Promise<void> ObjectServer::getBucket(GetBucketContext ctx) {
-  auto reply = ctx.getResults();
-  reply.setBucket(bucket_->addRef());
-  return kj::READY_NOW;
-}
-
-kj::Promise<void> ObjectServer::read(ReadContext ctx) {
-  auto params = ctx.getParams();
-  auto stream = params.getStream();
-  auto first = params.getFirst();
-  auto last = params.getLast();
-
-  auto out = bucket_->s3_->factory_->capnpToKj(kj::mv(stream));
-
-  auto headers = bucket_->headers_.cloneShallow();
-  headers.set(bucket_->s3_->ids_.range, kj::str(first, '-', last));
-
-  auto req = bucket_->s3_->awsService_->request(
-    kj::HttpMethod::GET,
-    kj::str("https://", bucket_->hostname_, "/", key_),
-    headers, 0ul
-  );
-
-  return
-    req.response
-    .then(
-      [this, ctx = kj::mv(ctx), out = kj::mv(out)](auto response) mutable {
-	auto& headers = response.headers;
-	
-	headers->forEach(
-	  [](auto name, auto value) {
-	    KJ_LOG(INFO, name, value);
-	  }
-	);
-
-	auto length = [&]{
-	  auto maybeValue = headers->get(kj::HttpHeaderId::CONTENT_LENGTH);
-	  auto value = KJ_REQUIRE_NONNULL(maybeValue);
-	  return value.template parseAs<uint64_t>();
-	}();
-	  
-	auto reply = ctx.getResults();
-	reply.setLength(length);
-
-	tasks_.add(
-	  response.body->pumpTo(*out)
-	  .ignoreResult()
-	  .attach(kj::mv(response.body), kj::mv(out))
-	);
-      }
-    );
-}
-
-kj::Promise<void> ObjectServer::write(WriteContext ctx) {
-  return kj::READY_NOW;
-}
-
-kj::Promise<void> ObjectServer::versions(VersionsContext ctx) {
-  return kj::READY_NOW;
-}
 
 struct MultipartStream
   : capnp::ByteStream::Server
@@ -381,8 +161,287 @@ private:
 
   kj::Vector<Part> parts_;
   kj::Own<kj::ArrayOutputStream> out_;
-
 };
+
+struct S3Server
+  : S3::Server
+  , kj::Refcounted
+  , kj::TaskSet::ErrorHandler {
+
+  S3Server(
+    kj::HttpHeaderTable::Builder& builder,
+    Credentials::Provider::Client credsProvider,
+    kj::Own<kj::HttpClient> client,
+    kj::StringPtr region,
+    kj::Maybe<capnp::ByteStreamFactory&> = nullptr
+  );
+
+  kj::Own<S3Server> addRef() {
+    return kj::addRef(*this);
+  }
+  
+  void taskFailed(kj::Exception&& exc) override {
+    KJ_LOG(ERROR, exc);
+  }
+
+  kj::Promise<void> list(ListContext) override;
+  kj::Promise<void> getBucket(GetBucketContext) override;
+
+  struct {
+    kj::HttpHeaderId etag;
+    kj::HttpHeaderId range;
+  } ids_;
+  
+  kj::TaskSet tasks_;
+  Credentials::Provider::Client credsProvider_;
+  kj::HttpHeaderTable& table_;
+  kj::Own<kj::HttpClient> client_;
+  kj::StringPtr region_;
+  kj::String hostname_;
+
+  kj::Own<capnp::ByteStreamFactory> factory_;
+};
+
+S3Server::S3Server(
+  kj::HttpHeaderTable::Builder& builder,
+  Credentials::Provider::Client credsProvider,
+  kj::Own<kj::HttpClient> client,
+  kj::StringPtr region,
+  kj::Maybe<capnp::ByteStreamFactory&> factory)
+  : tasks_{*this}
+  , credsProvider_{kj::mv(credsProvider)}
+  , ids_{ 
+      .etag{builder.add("etag")},
+      .range{builder.add("range")}
+  }
+  , table_{builder.getFutureTable()}
+  , client_{kj::mv(client)}
+  , region_{region}
+  , hostname_{kj::str("s3."_kj, region_, ".amazonaws.com")} {
+
+  KJ_IF_MAYBE(f, factory) {
+    factory_ = kj::Own<capnp::ByteStreamFactory>(f, kj::NullDisposer::instance);
+  }
+}
+
+kj::Promise<void> S3Server::list(ListContext ctx) {
+
+  KJ_DREQUIRE(headerTable_.isReady());
+  auto params = ctx.getParams();
+  auto callback = params.getCallback();
+
+  auto url = kj::str("https://"_kj, hostname_, "/"_kj);
+  kj::HttpHeaders headers{table_};
+  headers.set(kj::HttpHeaderId::HOST, hostname_);
+  auto req = client_->request(kj::HttpMethod::GET, url, headers);
+  return
+    kj::mv(req.response)
+
+    .then(
+      [](auto response) mutable {
+	KJ_LOG(INFO, response.statusCode);
+	KJ_LOG(INFO, response.statusText);
+	KJ_REQUIRE(response.statusCode != 400);
+	KJ_REQUIRE(response.body);
+	return response.body->readAllText().attach(kj::mv(response.body));
+      }
+    )
+    .then(
+	  [callback](kj::String txt) mutable {
+	KJ_LOG(INFO, txt);
+	kj::Vector<kj::Promise<void>> promises;
+
+	rapidxml::xml_document<> doc;
+	doc.parse<rapidxml::parse_non_destructive>(const_cast<char*>(txt.cStr()));
+
+	auto first_node = [](auto node, auto name) {
+	  return node->first_node(name.begin(), name.size());
+	};
+
+	auto next_sibling = [](auto node, auto name) {
+	  return node->next_sibling(name.begin(), name.size());
+	};
+
+	auto result = first_node(&doc, "ListAllMyBucketsResult"_kj);
+	result = first_node(result, "Buckets"_kj);
+	result = first_node(result, "Bucket"_kj);
+
+	while (result) {
+	  auto name = first_node(result, "Name"_kj);
+	  auto req = callback.nextRequest();
+	  req.setValue({name->value(), name->value_size()});
+	  promises.add(req.send().ignoreResult());
+	  result = next_sibling(result, "Bucket"_kj);
+	}
+
+	return kj::joinPromises(promises.releaseAsArray());
+      }
+    )
+    .then(
+      [callback]() mutable {
+	auto req = callback.endRequest();
+	return req.send().ignoreResult();
+      }
+    );
+}
+
+kj::Promise<void> S3Server::getBucket(GetBucketContext ctx) {
+  auto params = ctx.getParams();
+  auto name = params.getName();
+  auto reply = ctx.getResults();
+  reply.setBucket(kj::refcounted<BucketServer>(addRef(), name, region_));
+  return kj::READY_NOW;
+}
+  
+BucketServer::BucketServer(kj::Own<S3Server> s3, kj::StringPtr name, kj::StringPtr region)
+  : s3_{kj::mv(s3)}
+  , name_{kj::str(name)}
+  , hostname_{kj::str(name_, ".s3.", region, ".amazonaws.com")}
+  , url_{kj::str("https"), nullptr, kj::str(hostname_), {}, false, {}, nullptr, {}}
+  , headers_{s3_->table_} {
+
+  headers_.set(kj::HttpHeaderId::HOST, hostname_);
+}
+
+kj::Promise<void> BucketServer::getObject(GetObjectContext ctx) {
+  auto params = ctx.getParams();
+  auto key = params.getKey();
+  auto reply = ctx.getResults();
+  reply.setObject(kj::refcounted<ObjectServer>(addRef(), key));
+  return kj::READY_NOW;
+}
+
+kj::Promise<void> ObjectServer::head(HeadContext ctx) {
+  auto url = bucket_->url_.clone();
+  url.path.add(kj::str(key_));
+
+  auto req = bucket_->s3_->client_->request(
+    kj::HttpMethod::HEAD, url.toString(), bucket_->headers_, 0ul
+  );
+
+  return
+    req.response
+    .then(
+      [this, ctx = kj::mv(ctx)](auto response) mutable {
+	auto reply = ctx.getResults();
+	reply.setKey(key_);
+	KJ_LOG(INFO, response.statusText);
+	auto headers = reply.initHeaders(response.headers->size());
+	auto ii = 0u;
+	response.headers->forEach(
+          [&](auto name, auto value) {
+	    auto header = headers[ii++].initUncommon();
+	    header.setName(name);
+	    header.setValue(value);
+	    KJ_LOG(INFO, name, value);
+	  }
+	);
+      }
+    );
+}
+
+kj::Promise<void> ObjectServer::getBucket(GetBucketContext ctx) {
+  auto reply = ctx.getResults();
+  reply.setBucket(bucket_->addRef());
+  return kj::READY_NOW;
+}
+
+kj::Promise<void> ObjectServer::read(ReadContext ctx) {
+  return
+    bucket_->s3_->credsProvider_.getCredentialsRequest().send()
+    .then(
+      [this, ctx = kj::mv(ctx)](auto creds) mutable {
+	  auto params = ctx.getParams();
+  auto stream = params.getStream();
+  auto first = params.getFirst();
+  auto last = params.getLast();
+
+  auto out = bucket_->s3_->factory_->capnpToKj(kj::mv(stream));
+
+  auto headers = bucket_->headers_.cloneShallow();
+  headers.set(bucket_->s3_->ids_.range, kj::str(first, '-', last));
+
+  auto url = kj::str("https://", bucket_->hostname_, "/", key_);
+				    
+  auto req = bucket_->s3_->client_->request(
+    kj::HttpMethod::GET,
+    url,
+    headers, 0ul
+  );
+
+  return
+    req.response
+    .then(
+      [this, ctx = kj::mv(ctx), out = kj::mv(out)](auto response) mutable {
+	auto& headers = response.headers;
+	auto length = [&]{
+	  auto maybeValue = headers->get(kj::HttpHeaderId::CONTENT_LENGTH);
+	  auto value = KJ_REQUIRE_NONNULL(maybeValue);
+	  return value.template parseAs<uint64_t>();
+	}();
+	  
+	auto reply = ctx.getResults();
+	reply.setLength(length);
+
+	tasks_.add(
+	  response.body->pumpTo(*out)
+	  .ignoreResult()
+	  .attach(kj::mv(response.body), kj::mv(out))
+	);
+      }
+    );
+
+      }
+    );
+}
+
+kj::Promise<void> ObjectServer::write(WriteContext ctx) {
+  return
+    bucket_->s3_->credsProvider_.getCredentialsRequest().send()
+    .then(
+      [this, ctx = kj::mv(ctx)](auto creds) mutable {
+	  auto params = ctx.getParams();
+	  auto url = kj::str(
+            "https://", bucket_->hostname_, "/", key_
+          );
+	  auto headers = bucket_->headers_.cloneShallow();
+	  auto req = bucket_->s3_->client_->request(
+            kj::HttpMethod::POST, url, headers
+	  );
+
+	  auto stream = bucket_->s3_->factory_->kjToCapnp(kj::mv(req.body));
+	  auto reply = ctx.getResults();
+	  reply.setStream(kj::mv(stream));
+      }
+    );
+}
+
+kj::Promise<void> ObjectServer::multipart(MultipartContext ctx) {
+  auto url = kj::str("/", key_, "?uploads"_kj);
+  auto headers = bucket_->headers_.cloneShallow();
+  auto req = bucket_->s3_->client_->request(
+    kj::HttpMethod::POST, url, headers, 0ul
+  );
+  return
+    req.response
+    .then(
+      [](auto response) mutable {
+	return response.body->readAllBytes().attach(kj::mv(response.body));
+      }
+    )
+    .then(
+      [this, ctx = kj::mv(ctx)](auto bytes) mutable {
+	auto reply = ctx.getResults();
+	reply.setStream(kj::heap<MultipartStream>(addRef(), kj::str()));
+      }
+    );
+}
+
+kj::Promise<void> ObjectServer::versions(VersionsContext ctx) {
+  return kj::READY_NOW;
+}
+
+
 
 MultipartStream::MultipartStream(
     kj::Own<ObjectServer> object,
@@ -429,14 +488,14 @@ kj::Promise<void> MultipartStream::sendPart(
   part.partNumber_ = partNumber;
 
   auto url = kj::str(
-    "https://", object_->bucket_->hostname_, "/", object_->key_,
+    "/", object_->key_,
     "?partNumber=", partNumber,
     "&uploadId=", uploadId_
   );
 		
   auto headers = object_->bucket_->headers_.cloneShallow();
 
-  auto req = object_->bucket_->s3_->awsService_->request(
+  auto req = object_->bucket_->s3_->client_->request(
     kj::HttpMethod::PUT, url, headers, buffer.size()
   );
 
@@ -475,13 +534,10 @@ kj::Promise<kj::String> MultipartStream::complete() {
     "</CompleteMultipartUpload>"_kj
   ).flatten();
     
-  auto url = kj::str(
-    "https://", object_->bucket_->hostname_, "/", object_->key_,
-    "&uploadId=", uploadId_
-  );
+  auto url = kj::str("/", object_->key_, "&uploadId=", uploadId_);
 
   auto headers = object_->bucket_->headers_.cloneShallow();		     
-  auto req = object_->bucket_->s3_->awsService_->request(
+  auto req = object_->bucket_->s3_->client_->request(
     kj::HttpMethod::POST, url, headers, txt.size()
   );
 
@@ -536,11 +592,9 @@ capnp::ByteStream::Client multipart(
 
   auto& bucket = object->bucket_;
 
-  auto url = kj::str(
-    "https://", bucket->hostname_, "/", object->key_, "?uploads"_kj
-  );
+  auto url = kj::str("/", object->key_, "?uploads"_kj);
   auto headers = bucket->headers_.cloneShallow();		     
-  auto req = bucket->s3_->awsService_->request(
+  auto req = bucket->s3_->client_->request(
     kj::HttpMethod::POST, url, headers, 0ul
   );
   return
@@ -563,10 +617,19 @@ capnp::ByteStream::Client multipart(
 }
 
 aws::S3::Client newS3(
+  const kj::Clock& clock,
+  kj::Timer& timer,
+  kj::Network& network,
+  kj::Maybe<kj::Network&> tlsNetwork,
   kj::HttpHeaderTable::Builder& builder,
-  kj::Own<kj::HttpClient> awsService,
+  Credentials::Provider::Client credsProvider,
   kj::StringPtr region) {
-  return kj::refcounted<S3Server>(builder, kj::mv(awsService), region);
+  auto client = kj::newHttpClient(timer, builder.getFutureTable(), network, tlsNetwork);
+  auto proxy = kj::newHttpService(*client).attach(kj::mv(client));
+  auto awsService = newAwsService(clock, *proxy, builder, credsProvider, "s3", region).attach(kj::mv(proxy));
+  auto awsClient = kj::newHttpClient(*awsService).attach(kj::mv(awsService));
+  auto server = kj::refcounted<S3Server>(builder, kj::mv(credsProvider), kj::mv(awsClient), region);
+  return server;
 }
 
 }

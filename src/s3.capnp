@@ -51,8 +51,9 @@ interface S3 {
       first :UInt64 = 0,
       last :UInt64 = 0xFFFFFFFF) -> (length :UInt64);
     write @3 () -> (stream :ByteStream);
+    multipart @4 () -> (stream :ByteStream);
 
-    versions @4 (callback: Callback(Text));
+    versions @5 (callback: Callback(Text));
   }
 }
 

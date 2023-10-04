@@ -45,23 +45,6 @@ struct HttpTest
   Aws::SDKOptions awsOptions_;
 };
 
-TEST_F(HttpTest, CanonicalHeaders) {
-  kj::HttpHeaderTable::Builder builder;
-  HttpContext ctx{timer_, network_, *tlsNetwork_, builder};
-  auto table = builder.build();
-
-  kj::HttpHeaders headers{*table};
-  headers.set(ctx.accept, "*/*");
-  headers.set(ctx.amzSdkInvocationId, "CC978435-7447-4D01-A431-649E43C5E75B");
-  headers.set(ctx.amzSdkRequest, "attempt=1");
-  headers.set(kj::HttpHeaderId::HOST, "s3.eu-west-2.amazon.com");
-  headers.set(ctx.xAmzDate, "20230709T130622Z");
-  headers.set(ctx.xAmzContentSha256, hash::EMPTY_STRING_SHA256);
-
-  auto canon = ctx.canonicalHeaders(headers).flatten();
-  KJ_LOG(INFO, canon);
-  EXPECT_EQ(canon[canon.size()-1], '\n');
-}
 
 TEST_F(HttpTest, Basic2) {
 }
