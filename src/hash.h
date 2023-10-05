@@ -9,7 +9,6 @@
 #include <kj/string-tree.h>
 
 namespace aws {
-  kj::String uuid();
 
   struct HashContext {
     HashContext();

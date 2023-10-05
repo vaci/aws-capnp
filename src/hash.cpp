@@ -9,12 +9,7 @@
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 
-
-#include <aws/core/utils/crypto/Sha256HMAC.h>
-#include <aws/core/utils/Outcome.h>
-
 namespace aws {
-
 
 HashContext::HashContext() {
   mac_ = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
@@ -42,8 +37,16 @@ kj::Array<unsigned char> HashContext::hash(
   EVP_MAC_CTX_free(macCtx);
 
   return kj::heapArray(digest.begin(), digestSize); 
+}
 
-  /*
+}
+
+/*
+  AWS sha256 HMAC
+
+#include <aws/core/utils/crypto/Sha256HMAC.h>
+#include <aws/core/utils/Outcome.h>
+
   auto hmac = Aws::MakeUnique<Aws::Utils::Crypto::Sha256HMAC>("");
   auto hashResult = hmac->Calculate(
     {data.begin(), data.size()},
@@ -53,7 +56,5 @@ kj::Array<unsigned char> HashContext::hash(
   KJ_REQUIRE(hashResult.IsSuccess());
   auto result = hashResult.GetResult();
   return kj::heapArray(&result[0], result.GetLength());
-  */
-}
 
-}
+*/

@@ -5,6 +5,7 @@
 #include "common.h"
 #include "hash.h"
 #include "sha256.h"
+#include "uuid.h"
 
 #include <kj/debug.h>
 #include <kj/encoding.h>
@@ -15,7 +16,11 @@ namespace aws {
 struct AwsService
   : kj::HttpService {
 
-  constexpr static kj::StringPtr signedHeaders = "amz-sdk-invocation-id;amz-sdk-request;host;x-amz-content-sha256;x-amz-date"_kj;
+  constexpr static kj::StringPtr signedHeaders =
+    "amz-sdk-invocation-id;"
+    "amz-sdk-request;host;"
+    "x-amz-content-sha256;"
+    "x-amz-date"_kj;
 
   AwsService(
     const kj::Clock& clock,
