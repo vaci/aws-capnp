@@ -4,9 +4,6 @@
 #include <kj/common.h>
 #include <kj/debug.h>
 
-#include <openssl/crypto.h>
-#include <openssl/evp.h>
-
 namespace hash {
 
 namespace {
@@ -50,7 +47,25 @@ static constexpr uint32_t sig1(uint32_t x) {
   return rotr(x, 17) ^ rotr(x, 19) ^ (x >> 10);
 }
 
-}
+struct Sha256x
+  : Sha256 {
+
+  Sha256x() {}
+  void update(const char*);
+  void update(kj::StringPtr);
+  void update(kj::ArrayPtr<const uint8_t>);
+  kj::Array<uint8_t> digest();
+ 
+private:
+  void transform();
+  void pad();
+  void revert(uint8_t * hash);
+
+  kj::FixedArray<uint8_t, 64> m_data{};
+  kj::FixedArray<uint32_t, 8> m_state{}; // A, B, C, D, E, F, G, H
+  uint64_t m_bitlen{0};
+  uint32_t m_blocklen{0};
+};
 
 void Sha256x::update(kj::ArrayPtr<const uint8_t> data) {
   for (size_t ii = 0 ; ii < data.size() ; ++ii) {
@@ -169,72 +184,14 @@ void Sha256x::revert(uint8_t * hash) {
   }
 }
 
-kj::Array<uint8_t> sha256(kj::ArrayPtr<const unsigned char> bytes) {
-  KJ_STACK_ARRAY(unsigned char, digest, EVP_MAX_MD_SIZE, 256, 256);
-  unsigned int size = digest.size();
-  auto ctx = EVP_MD_CTX_new();
-  KJ_DEFER(EVP_MD_CTX_free(ctx));
-  KJ_REQUIRE(EVP_DigestInit_ex2(ctx, EVP_sha256(), nullptr) != 0);
-  KJ_REQUIRE(EVP_DigestUpdate(ctx, bytes.begin(), bytes.size()) != 0);
-  KJ_REQUIRE(EVP_DigestFinal_ex(ctx, digest.begin(), &size) != 0);
-  KJ_DREQUIRE(size == 32);
-  return kj::heapArray(digest.begin(), size);
-}
-  
-kj::Array<uint8_t> sha256(kj::StringTree& tree) {
-  KJ_STACK_ARRAY(unsigned char, digest, EVP_MAX_MD_SIZE, 128, 128);
-  unsigned int size = digest.size();
-  auto ctx = EVP_MD_CTX_new();
-  KJ_DEFER(EVP_MD_CTX_free(ctx));
-  KJ_REQUIRE(EVP_DigestInit_ex2(ctx, EVP_sha256(), nullptr) != 0);
-  tree.visit(
-    [&](auto str) {
-      auto bytes = str.asBytes();
-      KJ_REQUIRE(EVP_DigestUpdate(ctx, bytes.begin(), bytes.size()) != 0);
-    }
-  );
-  KJ_REQUIRE(EVP_DigestFinal_ex(ctx, digest.begin(), &size) != 0);
-  KJ_DREQUIRE(size == 32);
-  return kj::heapArray(digest.begin(), size);
+void Sha256x::update(const char* str) {
+  return update(kj::StringPtr{str});
 }
 
-namespace {
-struct Sha256Impl
-  : Sha256 {
-  Sha256Impl();
-  ~Sha256Impl();
-  
-  void update(kj::ArrayPtr<const uint8_t>) override;
-  kj::Array<uint8_t> digest() override;
-
-  EVP_MD_CTX* ctx_;
-};
-
-Sha256Impl::Sha256Impl()
-  : ctx_{EVP_MD_CTX_new()} {
-  EVP_DigestInit_ex2(ctx_, EVP_sha256(), nullptr);
+void Sha256x::update(kj::StringPtr str) {
+  return update(str.asBytes());
 }
 
-Sha256Impl::~Sha256Impl() {
-  EVP_MD_CTX_free(ctx_);
-}
-
-void Sha256Impl::update(kj::ArrayPtr<const uint8_t> data) {
-  KJ_REQUIRE(EVP_DigestUpdate(ctx_, data.begin(), data.size()));
-}
-
-kj::Array<uint8_t> Sha256Impl::digest() {
-  KJ_STACK_ARRAY(unsigned char, digest, EVP_MAX_MD_SIZE, 128, 128);
-  unsigned int size = digest.size();
-  KJ_REQUIRE(EVP_DigestFinal_ex(ctx_, digest.begin(), &size) != 0);
-  KJ_DREQUIRE(size == 32);
-  return kj::heapArray(digest.begin(), size);
-}
-
-}
-
-kj::Own<Sha256> newSha256() {
-  return kj::heap<Sha256Impl>();
 }
 
 }
