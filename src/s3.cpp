@@ -42,8 +42,7 @@ struct ObjectServer
   ObjectServer(
       kj::Own<BucketServer> bucket,
       kj::StringPtr key)
-    : tasks_{*this}
-    , bucket_{kj::mv(bucket)}
+    : bucket_{kj::mv(bucket)}
     , key_{kj::str(key)} {
   }
 
@@ -62,9 +61,9 @@ struct ObjectServer
   kj::Promise<void> multipart(MultipartContext) override;
   kj::Promise<void> versions(VersionsContext) override;
 
-  kj::TaskSet tasks_;
   kj::Own<BucketServer> bucket_;
   kj::String key_;
+  kj::TaskSet tasks_{*this};
 };
 
 struct BucketServer
@@ -147,7 +146,6 @@ private:
   kj::Promise<kj::String> complete();
   kj::Promise<kj::String> finish();
 
-  kj::TaskSet tasks_{*this};
   kj::Own<ObjectServer> object_;
   kj::String uploadId_;
   std::size_t bufferSize_;
@@ -161,6 +159,7 @@ private:
 
   kj::Vector<Part> parts_;
   kj::Own<kj::ArrayOutputStream> out_;
+  kj::TaskSet tasks_{*this};
 };
 
 struct S3Server
@@ -192,14 +191,13 @@ struct S3Server
     kj::HttpHeaderId range;
   } ids_;
   
-  kj::TaskSet tasks_;
   Credentials::Provider::Client credsProvider_;
   kj::HttpHeaderTable& table_;
   kj::Own<kj::HttpClient> client_;
   kj::StringPtr region_;
   kj::String hostname_;
-
   kj::Own<capnp::ByteStreamFactory> factory_;
+  kj::TaskSet tasks_{*this};
 };
 
 S3Server::S3Server(
@@ -208,8 +206,7 @@ S3Server::S3Server(
   kj::Own<kj::HttpClient> client,
   kj::StringPtr region,
   kj::Maybe<capnp::ByteStreamFactory&> factory)
-  : tasks_{*this}
-  , credsProvider_{kj::mv(credsProvider)}
+  : credsProvider_{kj::mv(credsProvider)}
   , ids_{ 
       .etag{builder.add("etag")},
       .range{builder.add("range")}
@@ -225,7 +222,6 @@ S3Server::S3Server(
 }
 
 kj::Promise<void> S3Server::list(ListContext ctx) {
-
   KJ_DREQUIRE(headerTable_.isReady());
   auto params = ctx.getParams();
   auto callback = params.getCallback();
@@ -247,7 +243,7 @@ kj::Promise<void> S3Server::list(ListContext ctx) {
       }
     )
     .then(
-	  [callback](kj::String txt) mutable {
+      [callback](kj::String txt) mutable {
 	KJ_LOG(INFO, txt);
 	kj::Vector<kj::Promise<void>> promises;
 
@@ -347,21 +343,14 @@ kj::Promise<void> ObjectServer::getBucket(GetBucketContext ctx) {
 }
 
 kj::Promise<void> ObjectServer::read(ReadContext ctx) {
-  return
-    bucket_->s3_->credsProvider_.getCredentialsRequest().send()
-    .then(
-      [this, ctx = kj::mv(ctx)](auto creds) mutable {
-	  auto params = ctx.getParams();
-  auto stream = params.getStream();
+  auto params = ctx.getParams();;
   auto first = params.getFirst();
   auto last = params.getLast();
-
-  auto out = bucket_->s3_->factory_->capnpToKj(kj::mv(stream));
-
-  auto headers = bucket_->headers_.cloneShallow();
-  headers.set(bucket_->s3_->ids_.range, kj::str(first, '-', last));
+  auto out = bucket_->s3_->factory_->capnpToKj(params.getStream());
 
   auto url = kj::str("https://", bucket_->hostname_, "/", key_);
+  auto headers = bucket_->headers_.cloneShallow();
+  headers.set(bucket_->s3_->ids_.range, kj::str(first, '-', last));
 				    
   auto req = bucket_->s3_->client_->request(
     kj::HttpMethod::GET,
@@ -373,16 +362,10 @@ kj::Promise<void> ObjectServer::read(ReadContext ctx) {
     req.response
     .then(
       [this, ctx = kj::mv(ctx), out = kj::mv(out)](auto response) mutable {
-	auto& headers = response.headers;
-	auto length = [&]{
-	  auto maybeValue = headers->get(kj::HttpHeaderId::CONTENT_LENGTH);
-	  auto value = KJ_REQUIRE_NONNULL(maybeValue);
-	  return value.template parseAs<uint64_t>();
-	}();
-	  
-	auto reply = ctx.getResults();
-	reply.setLength(length);
-
+	KJ_IF_MAYBE(length, response.body->tryGetLength()) {
+	  auto reply = ctx.getResults();
+	  reply.setLength(*length);
+	}
 	tasks_.add(
 	  response.body->pumpTo(*out)
 	  .ignoreResult()
@@ -390,30 +373,21 @@ kj::Promise<void> ObjectServer::read(ReadContext ctx) {
 	);
       }
     );
-
-      }
-    );
 }
 
 kj::Promise<void> ObjectServer::write(WriteContext ctx) {
-  return
-    bucket_->s3_->credsProvider_.getCredentialsRequest().send()
-    .then(
-      [this, ctx = kj::mv(ctx)](auto creds) mutable {
-	  auto params = ctx.getParams();
-	  auto url = kj::str(
-            "https://", bucket_->hostname_, "/", key_
-          );
-	  auto headers = bucket_->headers_.cloneShallow();
-	  auto req = bucket_->s3_->client_->request(
-            kj::HttpMethod::POST, url, headers
-	  );
 
-	  auto stream = bucket_->s3_->factory_->kjToCapnp(kj::mv(req.body));
-	  auto reply = ctx.getResults();
-	  reply.setStream(kj::mv(stream));
-      }
-    );
+  auto params = ctx.getParams();
+  auto url = kj::str("https://", bucket_->hostname_, "/", key_);
+  auto headers = bucket_->headers_.cloneShallow();
+  auto req = bucket_->s3_->client_->request(
+    kj::HttpMethod::POST, url, headers
+  );
+
+  auto stream = bucket_->s3_->factory_->kjToCapnp(kj::mv(req.body));
+  auto reply = ctx.getResults();
+  reply.setStream(kj::mv(stream));
+  return kj::READY_NOW;
 }
 
 kj::Promise<void> ObjectServer::multipart(MultipartContext ctx) {
@@ -440,8 +414,6 @@ kj::Promise<void> ObjectServer::multipart(MultipartContext ctx) {
 kj::Promise<void> ObjectServer::versions(VersionsContext ctx) {
   return kj::READY_NOW;
 }
-
-
 
 MultipartStream::MultipartStream(
     kj::Own<ObjectServer> object,
@@ -488,6 +460,7 @@ kj::Promise<void> MultipartStream::sendPart(
   part.partNumber_ = partNumber;
 
   auto url = kj::str(
+    "https://", object_->bucket_->hostname_,
     "/", object_->key_,
     "?partNumber=", partNumber,
     "&uploadId=", uploadId_
@@ -534,7 +507,11 @@ kj::Promise<kj::String> MultipartStream::complete() {
     "</CompleteMultipartUpload>"_kj
   ).flatten();
     
-  auto url = kj::str("/", object_->key_, "&uploadId=", uploadId_);
+  auto url = kj::str(
+    "https://", object_->bucket_->hostname_,
+    "/", object_->key_,
+    "&uploadId=", uploadId_
+  );
 
   auto headers = object_->bucket_->headers_.cloneShallow();		     
   auto req = object_->bucket_->s3_->client_->request(
@@ -606,8 +583,6 @@ capnp::ByteStream::Client multipart(
     )
     .then(
       [object = kj::mv(object)](auto bytes) mutable {
-
-
 	auto stream = kj::heap<MultipartStream>(kj::mv(object), kj::str());
 	return capnp::ByteStream::Client{kj::mv(stream)};
       }
