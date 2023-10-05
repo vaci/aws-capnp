@@ -10,6 +10,7 @@ struct CredentialsProviderServer
   : Credentials::Provider::Server {
 
   kj::Promise<void> getCredentials(GetCredentialsContext ctx) {
+    // TODO a blocking call :/
     auto awsCreds = credsProvider_->GetAWSCredentials();
     auto reply = ctx.getResults();
     reply.setAccessKey(awsCreds.GetAWSAccessKeyId());
@@ -21,7 +22,6 @@ struct CredentialsProviderServer
   std::shared_ptr<Aws::Auth::DefaultAWSCredentialsProviderChain> credsProvider_{
      std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>()
   };
-  
 };
 
 }
