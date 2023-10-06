@@ -19,7 +19,7 @@ kj::String dateStr(kj::Date date, kj::StringPtr format) {
   std::mktime(&tm);
 
   kj::FixedArray<char, 256> txt;
-  auto c = strftime(txt.begin(), txt.size(), format.begin(), &tm);
+  auto c = ::strftime(txt.begin(), txt.size(), format.begin(), &tm);
   KJ_DREQUIRE(c != 0);
   return kj::heapString(txt.begin(), c);
 }
@@ -33,7 +33,7 @@ kj::String yyyymmdd(kj::Date date) {
   std::mktime(&tm);
 
   kj::FixedArray<char, 9> txt;
-  auto c = strftime(txt.begin(), txt.size(), "%Y%m%d", &tm);
+  auto c = ::strftime(txt.begin(), txt.size(), "%Y%m%d", &tm);
   KJ_DREQUIRE(c != 0);
   return kj::heapString(txt.begin(), c);
 }

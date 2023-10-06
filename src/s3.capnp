@@ -49,11 +49,13 @@ interface S3 {
     read @2 (
       stream :ByteStream,
       first :UInt64 = 0,
-      last :UInt64 = 0xFFFFFFFF) -> (length :UInt64);
-    write @3 () -> (stream :ByteStream);
+      last :UInt64 = 0xFFFFFFFF);
+    write @3 (length :UInt64) -> (stream :ByteStream);
     multipart @4 () -> (stream :ByteStream);
 
     versions @5 (callback: Callback(Text));
+
+    delete @6 ();
   }
 }
 

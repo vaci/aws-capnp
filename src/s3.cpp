@@ -60,6 +60,7 @@ struct ObjectServer
   kj::Promise<void> write(WriteContext) override;
   kj::Promise<void> multipart(MultipartContext) override;
   kj::Promise<void> versions(VersionsContext) override;
+  kj::Promise<void> delete_(DeleteContext) override;
 
   kj::Own<BucketServer> bucket_;
   kj::String key_;
@@ -106,6 +107,7 @@ struct MultipartStream
   }
 
   kj::Promise<void> end(EndContext) override {
+    KJ_LOG(INFO, "FINISHING");
     return finish().ignoreResult();
   }
 
@@ -148,9 +150,9 @@ private:
 
   kj::Own<ObjectServer> object_;
   kj::String uploadId_;
-  std::size_t bufferSize_;
+  std::size_t bufferSize_{8*1024*1024};
 
-  kj::Array<kj::byte> buffer_;
+  kj::Array<kj::byte> buffer_{kj::heapArray<kj::byte>(bufferSize_)};
 
   struct Part {
     uint32_t partNumber_;
@@ -158,7 +160,7 @@ private:
   };
 
   kj::Vector<Part> parts_;
-  kj::Own<kj::ArrayOutputStream> out_;
+  kj::Own<kj::ArrayOutputStream> out_{kj::heap<kj::ArrayOutputStream>(buffer_)};
   kj::TaskSet tasks_{*this};
 };
 
@@ -362,10 +364,6 @@ kj::Promise<void> ObjectServer::read(ReadContext ctx) {
     req.response
     .then(
       [this, ctx = kj::mv(ctx), out = kj::mv(out)](auto response) mutable {
-	KJ_IF_MAYBE(length, response.body->tryGetLength()) {
-	  auto reply = ctx.getResults();
-	  reply.setLength(*length);
-	}
 	tasks_.add(
 	  response.body->pumpTo(*out)
 	  .ignoreResult()
@@ -376,22 +374,49 @@ kj::Promise<void> ObjectServer::read(ReadContext ctx) {
 }
 
 kj::Promise<void> ObjectServer::write(WriteContext ctx) {
-
   auto params = ctx.getParams();
+  auto length = params.getLength();
   auto url = kj::str("https://", bucket_->hostname_, "/", key_);
   auto headers = bucket_->headers_.cloneShallow();
   auto req = bucket_->s3_->client_->request(
-    kj::HttpMethod::POST, url, headers
+    kj::HttpMethod::PUT, url, headers, length
   );
 
   auto stream = bucket_->s3_->factory_->kjToCapnp(kj::mv(req.body));
   auto reply = ctx.getResults();
   reply.setStream(kj::mv(stream));
+  tasks_.add(
+    req.response.then(
+      [](auto response) {
+	KJ_LOG(INFO, "COMPLETED", response.statusText);
+      }
+    )
+  );
   return kj::READY_NOW;
 }
 
+kj::Promise<void> ObjectServer::delete_(DeleteContext ctx) {
+
+  auto params = ctx.getParams();
+  auto url = kj::str("https://", bucket_->hostname_, "/", key_);
+  auto headers = bucket_->headers_.cloneShallow();
+  auto req = bucket_->s3_->client_->request(
+    kj::HttpMethod::DELETE, url, headers
+  );
+  return req.response.ignoreResult();
+}
+
+  /*
+
+<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+<Bucket>vaci-bf</Bucket>
+<Key>d2229ad6-4a6d-41ef-8435-1e554e418e06</Key>
+<UploadId>OR61QsJLLojN88aArchMUxp_X5FXyvJaXoBmZY2EQxkue2nspflugORwm305reoI_EDugmidQa2u6KiwaptbTgn62SBaFurQB0un6YOSV9u4nKa1920Ia7RRXv5SVVHs</UploadId>
+</InitiateMultipartUploadResult>
+
+  */
 kj::Promise<void> ObjectServer::multipart(MultipartContext ctx) {
-  auto url = kj::str("/", key_, "?uploads"_kj);
+  auto url = kj::str("https://", bucket_->hostname_, "/", key_, "?uploads"_kj);
   auto headers = bucket_->headers_.cloneShallow();
   auto req = bucket_->s3_->client_->request(
     kj::HttpMethod::POST, url, headers, 0ul
@@ -400,13 +425,28 @@ kj::Promise<void> ObjectServer::multipart(MultipartContext ctx) {
     req.response
     .then(
       [](auto response) mutable {
-	return response.body->readAllBytes().attach(kj::mv(response.body));
+	return response.body->readAllText().attach(kj::mv(response.body));
       }
     )
     .then(
-      [this, ctx = kj::mv(ctx)](auto bytes) mutable {
+      [this, ctx = kj::mv(ctx)](auto txt) mutable {
+	KJ_LOG(INFO, txt);
+	rapidxml::xml_document<> doc;
+	doc.parse<rapidxml::parse_non_destructive>(const_cast<char*>(txt.cStr()));
+
+	auto first_node = [](auto node, auto name) {
+	  return node->first_node(name.begin(), name.size());
+	};
+
+	auto result = first_node(&doc, "InitiateMultipartUploadResult"_kj);
+	auto uploadId = first_node(result, "UploadId"_kj);
 	auto reply = ctx.getResults();
-	reply.setStream(kj::heap<MultipartStream>(addRef(), kj::str()));
+	reply.setStream(
+	  kj::heap<MultipartStream>(
+	    addRef(),
+	    kj::StringPtr{uploadId->value(), uploadId->value_size()}
+	  )
+	 );
       }
     );
 }
@@ -420,6 +460,7 @@ MultipartStream::MultipartStream(
     kj::StringPtr uploadId)
   : object_{kj::mv(object)}
   , uploadId_{kj::str(uploadId)} {
+  KJ_LOG(INFO, uploadId_);
 }
 
 kj::Promise<void> MultipartStream::write(kj::ArrayPtr<kj::byte const> bytes) {
@@ -428,6 +469,7 @@ kj::Promise<void> MultipartStream::write(kj::ArrayPtr<kj::byte const> bytes) {
   }
 
   auto remaining = buffer_.size() - out_->getArray().size();
+  KJ_LOG(INFO, bytes.size(), remaining);
   KJ_DREQUIRE(remaining);
 
   if (bytes.size() <= remaining) {
@@ -467,7 +509,6 @@ kj::Promise<void> MultipartStream::sendPart(
   );
 		
   auto headers = object_->bucket_->headers_.cloneShallow();
-
   auto req = object_->bucket_->s3_->client_->request(
     kj::HttpMethod::PUT, url, headers, buffer.size()
   );
@@ -482,6 +523,7 @@ kj::Promise<void> MultipartStream::sendPart(
     )
     .then(
       [this, partNumber](auto response) {
+	KJ_LOG(INFO, response.statusText);
 	auto& headers = response.headers;
 	auto etag = KJ_REQUIRE_NONNULL(headers->get(object_->bucket_->s3_->ids_.etag));
 	parts_[partNumber-1].etag_ = kj::str(etag);
@@ -489,12 +531,26 @@ kj::Promise<void> MultipartStream::sendPart(
     );
 } 
 
+  /*
+    <CompleteMultipartUploadResult>
+   <Location>string</Location>
+   <Bucket>string</Bucket>
+   <Key>string</Key>
+   <ETag>string</ETag>
+   <ChecksumCRC32>string</ChecksumCRC32>
+   <ChecksumCRC32C>string</ChecksumCRC32C>
+   <ChecksumSHA1>string</ChecksumSHA1>
+   <ChecksumSHA256>string</ChecksumSHA256>
+</CompleteMultipartUploadResult>
+
+  */
+ 
 kj::Promise<kj::String> MultipartStream::complete() {
   KJ_LOG(INFO, "Completing", uploadId_);
   KJ_DREQUIRE(started_);
 
-  auto txt = kj::strTree(
-    "<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"_kj,
+  auto txt = kj::strTree(		 
+    R"(<CompleteMultipartUpload>)"_kj,
     KJ_MAP(part, parts_) {
       return kj::strTree(
         "<Part><PartNumber>"_kj,
@@ -510,7 +566,7 @@ kj::Promise<kj::String> MultipartStream::complete() {
   auto url = kj::str(
     "https://", object_->bucket_->hostname_,
     "/", object_->key_,
-    "&uploadId=", uploadId_
+    "?uploadId=", uploadId_
   );
 
   auto headers = object_->bucket_->headers_.cloneShallow();		     
@@ -519,18 +575,20 @@ kj::Promise<kj::String> MultipartStream::complete() {
   );
 
   return
-    req.body->write(txt.begin(), txt.size())
+    req.body->write(txt.begin(), txt.size()).attach(kj::mv(req.body))
     .then(
-      [req = kj::mv(req)]() mutable {
-        req.body = nullptr;
-	return kj::mv(req.response);
+      [response = kj::mv(req.response)]() mutable {
+	return kj::mv(response);
       }
     )
     .then(
       [this](auto response) {
-	auto& headers = response.headers;
-	auto etag = KJ_REQUIRE_NONNULL(headers->get(object_->bucket_->s3_->ids_.etag));
-	return kj::str(etag);
+	return response.body->readAllText().attach(kj::mv(response.body));
+      }
+    )
+    .then(
+      [this](auto txt) {
+	return kj::str();
       }
     );
 }

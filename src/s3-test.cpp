@@ -177,9 +177,142 @@ TEST_F(S3Test, GetObject) {
 
     auto txt = pipe.in->readAllText().wait(waitScope_);
     KJ_LOG(INFO, txt);
-    EXPECT_EQ(txt.size(), reply.getLength());
   }
 }
+
+TEST_F(S3Test, PutObject) {
+  auto service = "s3"_kj;
+  auto region = "eu-west-1"_kj;
+  auto creds = ::aws::newCredentialsProvider();
+
+  kj::HttpHeaderTable::Builder builder;
+
+  auto s3 = newS3(kj::systemPreciseCalendarClock(), timer_, network_, *tlsNetwork_, builder, kj::mv(creds), region);
+  auto headerTable = builder.build();
+
+  auto bucket = [&]{
+    auto req = s3.getBucketRequest();
+    req.setName("vaci-bf"_kj);
+    return req.send().getBucket();
+  }();
+
+  auto obj = [&]{
+    auto req = bucket.getObjectRequest();
+    req.setKey(uuid());
+    return req.send().getObject();
+  }();
+
+  {
+    auto req = obj.headRequest();
+    auto reply = req.send().wait(waitScope_);
+    KJ_LOG(INFO, reply);
+  }
+
+  KJ_LOG(INFO, "WRITING...");
+  {
+    auto content = uuid();
+    auto bytes = content.asBytes();
+    auto req = obj.writeRequest();
+    req.setLength(bytes.size());
+    auto reply = req.send().wait(waitScope_);
+    KJ_LOG(INFO, reply);
+
+    auto stream = reply.getStream();
+    {
+      auto req = stream.writeRequest();
+      req.setBytes(bytes);
+      req.send().wait(waitScope_);
+    }
+    {
+      auto req = stream.endRequest();
+      req.send().wait(waitScope_);
+    }
+  }
+
+  KJ_LOG(INFO, "READING...");
+  {
+    auto pipe = kj::newOneWayPipe();
+    capnp::ByteStreamFactory factory;
+    auto out = factory.kjToCapnp(kj::mv(pipe.out));
+    auto req = obj.readRequest();
+    req.setStream(kj::mv(out));
+    auto reply = req.send().wait(waitScope_);
+    KJ_LOG(INFO, reply);
+
+    auto txt = pipe.in->readAllText().wait(waitScope_);
+    KJ_LOG(INFO, txt);
+  }
+
+  {
+    auto req = obj.deleteRequest();
+    auto reply = req.send().wait(waitScope_);
+    KJ_LOG(INFO, reply);
+  }
+}
+
+TEST_F(S3Test, PutMultipartObject) {
+  auto service = "s3"_kj;
+  auto region = "eu-west-1"_kj;
+  auto creds = ::aws::newCredentialsProvider();
+
+  kj::HttpHeaderTable::Builder builder;
+
+  auto s3 = newS3(kj::systemPreciseCalendarClock(), timer_, network_, *tlsNetwork_, builder, kj::mv(creds), region);
+  auto headerTable = builder.build();
+
+  auto bucket = [&]{
+    auto req = s3.getBucketRequest();
+    req.setName("vaci-bf"_kj);
+    return req.send().getBucket();
+  }();
+
+  auto obj = [&]{
+    auto req = bucket.getObjectRequest();
+    req.setKey(uuid());
+    return req.send().getObject();
+  }();
+
+  KJ_LOG(INFO, "WRITING...");
+  {
+    auto content = uuid();
+    auto bytes = content.asBytes();
+    auto req = obj.multipartRequest();
+    auto reply = req.send().wait(waitScope_);
+    KJ_LOG(INFO, reply);
+
+    auto stream = reply.getStream();
+    {
+      auto req = stream.writeRequest();
+      req.setBytes(bytes);
+      req.send().wait(waitScope_);
+    }
+    {
+      auto req = stream.endRequest();
+      req.send().wait(waitScope_);
+    }
+  }
+
+  KJ_LOG(INFO, "READING...");
+  {
+    auto pipe = kj::newOneWayPipe();
+    capnp::ByteStreamFactory factory;
+    auto out = factory.kjToCapnp(kj::mv(pipe.out));
+    auto req = obj.readRequest();
+    req.setStream(kj::mv(out));
+    auto reply = req.send().wait(waitScope_);
+    KJ_LOG(INFO, reply);
+
+    auto txt = pipe.in->readAllText().wait(waitScope_);
+    KJ_LOG(INFO, txt);
+  }
+
+  {
+    auto req = obj.deleteRequest();
+    auto reply = req.send().wait(waitScope_);
+    KJ_LOG(INFO, reply);
+  }
+}
+
 
 TEST_F(S3Test, BasicHttp) {
   

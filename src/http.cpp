@@ -144,6 +144,14 @@ kj::Promise<void> AwsService::request(
 	  ", Signature="_kj, signature);
 
 	headers.set(ids_.auth, kj::mv(authTxt));
+
+	KJ_LOG(INFO, url);
+	KJ_LOG(INFO, contentHash);
+	headers.forEach(
+	  [](auto name, auto value) {
+	    KJ_LOG(INFO, name, value);
+	  }
+	);
 	return proxy_.request(method, url, headers, body, response);
      }
    );
@@ -169,8 +177,14 @@ kj::String AwsService::hashRequest(
   sha256->update("\n"_kj);
   sha256->update(path);
   sha256->update("\n"_kj);
-  //sha256->update(""); // query string
-  sha256->update("\n"_kj);
+
+  {
+    auto query = KJ_MAP(param, url.query) {
+      return kj::str(param.name, "=", param.value);
+    };
+    sha256->update(kj::strArray(query, "&"));
+    sha256->update("\n"_kj);
+  }
 	  
   auto hashHeader = [&](auto name, auto&& value) {
     sha256->update(name);
