@@ -1,4 +1,4 @@
 # aws-capnp
 Capnproto interfaces to AWS services
 
-Initial rough outline
+Implements S3 API and integrates with capnp ByteStreams for reading and writing objects.
