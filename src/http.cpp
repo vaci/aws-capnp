@@ -96,7 +96,7 @@ kj::Promise<void> AwsService::request(
     credsProvider_.getCredentialsRequest().send()
     .then(
       [this, method, url, &requestHeaders, &body, &response](auto creds) mutable {
-	auto id = uuid();
+	auto id = uuid::random();
 	auto date = clock_.now();
 	auto ds = dateStr(date, "%Y%m%dT%H%M%SZ"_kj);
 	auto ymd = ds.slice(0, 8);

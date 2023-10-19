@@ -215,7 +215,7 @@ TEST_F(S3Test, PutObject) {
 
   auto obj = [&]{
     auto req = bucket.getObjectRequest();
-    req.setKey(uuid());
+    req.setKey(uuid::random());
     return req.send().getObject();
   }();
 
@@ -227,7 +227,7 @@ TEST_F(S3Test, PutObject) {
 
   KJ_LOG(INFO, "WRITING...");
   {
-    auto content = uuid();
+    auto content = uuid::random();
     auto bytes = content.asBytes();
     auto req = obj.writeRequest();
     req.setLength(bytes.size());
@@ -285,12 +285,12 @@ TEST_F(S3Test, PutMultipartObject) {
 
   auto obj = [&]{
     auto req = bucket.getObjectRequest();
-    req.setKey(uuid());
+    req.setKey(uuid::random());
     return req.send().getObject();
   }();
 
   {
-    auto content = uuid();
+    auto content = uuid::random();
     auto bytes = content.asBytes();
     auto req = obj.multipartRequest();
     auto reply = req.send().wait(waitScope_);
@@ -364,7 +364,7 @@ TEST_F(S3Test, BasicHttp) {
   headers.set(auth, kj::str("AWS4-HMAC-SHA256 Credential=", accessKey, "/", yyyymmdd(date), "/", "eu-west-2", "/", "s3", "/aws4_request, SignedHeaders=host;x-amz-date, Signature=", signature));
   headers.set(awsDate, dateStr(date, "%Y%m%dT%H%M%SZ"));
   headers.set(host, "");
-  headers.set(invocationId, uuid());
+  headers.set(invocationId, uuid::random());
  
 
   headers.forEach([](auto name, auto value) {

@@ -404,21 +404,26 @@ kj::Promise<void> ObjectServer::write(WriteContext ctx) {
 }
 
 kj::Promise<void> ObjectServer::delete_(DeleteContext ctx) {
-  auto params = ctx.getParams();
-  auto url = kj::str("https://"_kj, bucket_->hostname_, '/', key_);
+  auto url = bucket_->url_.clone();
+  url.path.add(kj::str(key_));
+
   auto headers = bucket_->headers_.cloneShallow();
   auto req = bucket_->s3_->client_->request(
-    kj::HttpMethod::DELETE, url, headers, 0ul
+    kj::HttpMethod::DELETE, url.toString(), headers, 0ul
   );
   return req.response.ignoreResult();
 }
 
 kj::Promise<void> ObjectServer::multipart(MultipartContext ctx) {
-  auto url = kj::str("https://"_kj, bucket_->hostname_, '/', key_, "?uploads"_kj);
+  auto url = bucket_->url_.clone();
+  url.path.add(kj::str(key_));
+  url.query.add(kj::str("uploads"_kj), nullptr);
+
   auto headers = bucket_->headers_.cloneShallow();
   auto req = bucket_->s3_->client_->request(
-    kj::HttpMethod::POST, url, headers, 0ul
+    kj::HttpMethod::POST, url.toString(), headers, 0ul
   );
+
   return
     req.response
     .then(
@@ -459,7 +464,6 @@ kj::Promise<void> MultipartStream::write(kj::ArrayPtr<kj::byte const> bytes) {
   }
 
   auto remaining = buffer_.size() - out_->getArray().size();
-  KJ_LOG(INFO, bytes.size(), remaining);
   KJ_DREQUIRE(remaining);
 
   if (remaining <= bytes.size()) {
@@ -490,14 +494,14 @@ kj::Promise<void> MultipartStream::sendPart(
   auto partNumber = parts_.size();
   part.partNumber_ = partNumber;
 
-  auto url = kj::str(
-    "https://"_kj, object_->bucket_->hostname_, '/', object_->key_,
-    "?partNumber="_kj, partNumber, "&uploadId="_kj, uploadId_
-  );
+  auto url = object_->bucket_->url_.clone();
+  url.path.add(kj::str(object_->key_));
+  url.query.add(kj::str("partNumber"_kj), kj::str(partNumber));
+  url.query.add(kj::str("uploadId"_kj), kj::str(uploadId_));
 		
   auto headers = object_->bucket_->headers_.cloneShallow();
   auto req = object_->bucket_->s3_->client_->request(
-    kj::HttpMethod::PUT, url, headers, buffer.size()
+    kj::HttpMethod::PUT, url.toString(), headers, buffer.size()
   );
 
   return

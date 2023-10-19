@@ -6,14 +6,22 @@
 
 #include <uuid/uuid.h>
 
-namespace aws {
+namespace {
 
-kj::String uuid() {
+inline auto KJ_STRINGIFY(uuid_t uuid) {
+  kj::FixedArray<char, 36> txt;
+  uuid_unparse(uuid, txt.begin());
+  return kj::mv(txt);
+}
+
+}
+
+namespace aws::uuid {
+
+kj::String random() {
   uuid_t uuid;
   uuid_generate_random(uuid);
-  auto txt = kj::heapArray<char>(37);
-  uuid_unparse(uuid, txt.begin());
-  return kj::String{kj::mv(txt)};
+  return kj::str(uuid);
 }
 
 }

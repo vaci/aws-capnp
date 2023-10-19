@@ -6,6 +6,6 @@
 
 #include <kj/string.h>
 
-namespace aws {
-  kj::String uuid();
+namespace aws::uuid {
+  kj::String random();
 }
