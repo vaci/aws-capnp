@@ -47,6 +47,7 @@ struct AwsService
     kj::HttpHeaderId auth;
     kj::HttpHeaderId xAmzContentSha256;
     kj::HttpHeaderId xAmzDate;
+    kj::HttpHeaderId xAmzSecurityToken;
   } ids_;
 
   kj::HttpHeaderTable& table_;
@@ -71,7 +72,8 @@ AwsService::AwsService(
       .amzSdkRequest{builder.add("amz-sdk-request")},
       .auth{builder.add("authorization")},
       .xAmzContentSha256{builder.add("x-amz-content-sha256")},
-      .xAmzDate{builder.add("x-amz-date")}
+      .xAmzDate{builder.add("x-amz-date")},
+      .xAmzSecurityToken{builder.add("X-Amz-Security-Token")}
     }
   , table_{builder.getFutureTable()}
   , proxy_{proxy}
@@ -94,7 +96,6 @@ kj::Promise<void> AwsService::request(
     credsProvider_.getCredentialsRequest().send()
     .then(
       [this, method, url, &requestHeaders, &body, &response](auto creds) mutable {
-	auto headers = requestHeaders.cloneShallow();	
 	auto id = uuid();
 	auto date = clock_.now();
 	auto ds = dateStr(date, "%Y%m%dT%H%M%SZ"_kj);
@@ -107,25 +108,32 @@ kj::Promise<void> AwsService::request(
 	  }
 	}
 
-	auto accessKey =  creds.getAccessKey();
-	auto secretKey =  creds.getSecretKey();
-
+	auto headers = requestHeaders.cloneShallow();	
 	headers.set(ids_.amzSdkInvocationId, id);
 	headers.set(ids_.amzSdkRequest, "attempt=1");
 	headers.set(ids_.xAmzDate, ds);
 	headers.set(ids_.xAmzContentSha256, contentHash);
 
-	auto requestHash = hashRequest(method, url, headers);
+	{
+	  auto sessionToken = creds.getSessionToken();
+	  if (sessionToken.size()) {
+	    headers.set(ids_.xAmzSecurityToken, sessionToken);
+	  }
+	}
+
 	auto signature = [&]{
+	  auto requestHash = hashRequest(method, url, headers);
+
 	  KJ_STACK_ARRAY(char, strBuffer, 512, 512, 512);	
 	  auto stringToSign = kj::strPreallocated(
 	    strBuffer,
 	    "AWS4-HMAC-SHA256\n"_kj,
-	    ds, "\n"_kj,
-	    ymd, scope_, "\n"_kj,
+	    ds, '\n',
+	    ymd, scope_, '\n',
 	    requestHash
 	  );
 
+	  auto secretKey =  creds.getSecretKey();
 	  KJ_STACK_ARRAY(char, keyBuffer, 4 + secretKey.size() + 1, 128, 128);	
 	  auto signingKey = kj::strPreallocated(keyBuffer, "AWS4"_kj, secretKey);
 
@@ -138,20 +146,15 @@ kj::Promise<void> AwsService::request(
 	  return kj::encodeHex(hash);
 	}();
 
-	auto authTxt = kj::str(
-          "AWS4-HMAC-SHA256 Credential="_kj, accessKey, "/"_kj, ymd, scope_,
-	  ", SignedHeaders="_kj, signedHeaders,
-	  ", Signature="_kj, signature);
+	{
+	  auto accessKey =  creds.getAccessKey();
+	  auto authTxt = kj::str(
+	    "AWS4-HMAC-SHA256 Credential="_kj, accessKey, '/', ymd, scope_,
+	    ", SignedHeaders="_kj, signedHeaders,
+	    ", Signature="_kj, signature);
 
-	headers.set(ids_.auth, kj::mv(authTxt));
-
-	KJ_LOG(INFO, url);
-	KJ_LOG(INFO, contentHash);
-	headers.forEach(
-	  [](auto name, auto value) {
-	    KJ_LOG(INFO, name, value);
-	  }
-	);
+	  headers.set(ids_.auth, kj::mv(authTxt));
+	}
 	return proxy_.request(method, url, headers, body, response);
      }
    );

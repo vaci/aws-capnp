@@ -55,17 +55,9 @@ struct S3Server;
 struct BucketServer;
 struct ObjectServer;
 
-capnp::ByteStream::Client multipart(
-  kj::Own<ObjectServer> object,
-  kj::StringPtr key,
-  kj::StringPtr contentType,
-  capnp::List<capnp::HttpHeader>::Reader headers);
-
-  
 struct ObjectServer
   : S3::Object::Server
-  , kj::Refcounted
-  , kj::TaskSet::ErrorHandler {
+  , kj::Refcounted {
 
   ObjectServer(
       kj::Own<BucketServer> bucket,
@@ -78,21 +70,15 @@ struct ObjectServer
     return kj::addRef(*this);
   }
 
-  void taskFailed(kj::Exception&& exc) override {
-    KJ_LOG(ERROR, exc);
-  }
-
   kj::Promise<void> head(HeadContext) override;
   kj::Promise<void> getBucket(GetBucketContext) override;
   kj::Promise<void> read(ReadContext) override;
   kj::Promise<void> write(WriteContext) override;
   kj::Promise<void> multipart(MultipartContext) override;
-  kj::Promise<void> versions(VersionsContext) override;
   kj::Promise<void> delete_(DeleteContext) override;
 
   kj::Own<BucketServer> bucket_;
   kj::String key_;
-  kj::TaskSet tasks_{*this};
 };
 
 struct BucketServer
@@ -201,7 +187,7 @@ struct S3Server
     Credentials::Provider::Client credsProvider,
     kj::Own<kj::HttpClient> client,
     kj::StringPtr region,
-    kj::Maybe<capnp::ByteStreamFactory&> = nullptr
+    capnp::ByteStreamFactory&
   );
 
   kj::Own<S3Server> addRef() {
@@ -212,7 +198,7 @@ struct S3Server
     KJ_LOG(ERROR, exc);
   }
 
-  kj::Promise<void> list(ListContext) override;
+  kj::Promise<void> listBuckets(ListBucketsContext) override;
   kj::Promise<void> getBucket(GetBucketContext) override;
 
   struct {
@@ -225,7 +211,7 @@ struct S3Server
   kj::Own<kj::HttpClient> client_;
   kj::StringPtr region_;
   kj::String hostname_;
-  kj::Own<capnp::ByteStreamFactory> factory_;
+  capnp::ByteStreamFactory& factory_;
   kj::TaskSet tasks_{*this};
 };
 
@@ -234,7 +220,7 @@ S3Server::S3Server(
   Credentials::Provider::Client credsProvider,
   kj::Own<kj::HttpClient> client,
   kj::StringPtr region,
-  kj::Maybe<capnp::ByteStreamFactory&> factory)
+  capnp::ByteStreamFactory& factory)
   : credsProvider_{kj::mv(credsProvider)}
   , ids_{ 
       .etag{builder.add("etag")},
@@ -243,17 +229,13 @@ S3Server::S3Server(
   , table_{builder.getFutureTable()}
   , client_{kj::mv(client)}
   , region_{region}
-  , hostname_{kj::str("s3."_kj, region_, ".amazonaws.com")} {
-
-  KJ_IF_MAYBE(f, factory) {
-    factory_ = kj::Own<capnp::ByteStreamFactory>(f, kj::NullDisposer::instance);
-  }
+  , hostname_{kj::str("s3."_kj, region_, ".amazonaws.com")}
+  , factory_{factory} {
 }
 
-kj::Promise<void> S3Server::list(ListContext ctx) {
+kj::Promise<void> S3Server::listBuckets(ListBucketsContext ctx) {
   KJ_DREQUIRE(headerTable_.isReady());
   auto params = ctx.getParams();
-  auto callback = params.getCallback();
 
   auto url = kj::str("https://"_kj, hostname_, "/"_kj);
   kj::HttpHeaders headers{table_};
@@ -272,9 +254,9 @@ kj::Promise<void> S3Server::list(ListContext ctx) {
       }
     )
     .then(
-      [callback](kj::String txt) mutable {
+      [ctx = kj::mv(ctx)](kj::String txt) mutable {
 	KJ_LOG(INFO, txt);
-	kj::Vector<kj::Promise<void>> promises;
+	kj::Vector<capnp::Text::Reader> names;
 
 	rapidxml::xml_document<> doc;
 	doc.parse<rapidxml::parse_non_destructive>(const_cast<char*>(txt.cStr()));
@@ -289,23 +271,19 @@ kj::Promise<void> S3Server::list(ListContext ctx) {
 	auto& buckets = KJ_REQUIRE_NONNULL(firstNode(result, "Buckets"_kj));
 	auto bucket = firstNode(buckets, "Bucket"_kj);
 
-	while (bucket != nullptr) {
+	while (true) {
 	  KJ_IF_MAYBE(b, bucket) {
 	    auto& name = KJ_REQUIRE_NONNULL(firstNode(*b, "Name"_kj));
-	    auto req = callback.nextRequest();
-	    req.setValue({name.value(), name.value_size()});
-	    promises.add(req.send().ignoreResult());
+	    names.add(name.value(), name.value_size());
+	    bucket = nextSibling(*b, "Bucket"_kj);
 	  }
-	  bucket = nextSibling(KJ_REQUIRE_NONNULL(bucket), "Bucket"_kj);
+	  else {
+	    break;
+	  }
 	}
 
-	return kj::joinPromises(promises.releaseAsArray());
-      }
-    )
-    .then(
-      [callback]() mutable {
-	auto req = callback.endRequest();
-	return req.send().ignoreResult();
+	auto reply = ctx.getResults();
+	reply.setBucketNames(names);
       }
     );
 }
@@ -337,9 +315,15 @@ kj::Promise<void> BucketServer::getObject(GetObjectContext ctx) {
 }
 
 kj::Promise<void> ObjectServer::head(HeadContext ctx) {
+  auto params = ctx.getParams();
+  auto version = params.getVersion();
+
   auto url = bucket_->url_.clone();
   url.path.add(kj::str(key_));
-
+  if (version.size()) {
+    url.query.add(kj::str("versionId"_kj), kj::str(version));
+  }
+  
   auto req = bucket_->s3_->client_->request(
     kj::HttpMethod::HEAD, url.toString(), bucket_->headers_, 0ul
   );
@@ -349,8 +333,6 @@ kj::Promise<void> ObjectServer::head(HeadContext ctx) {
     .then(
       [this, ctx = kj::mv(ctx)](auto response) mutable {
 	auto reply = ctx.getResults();
-	reply.setKey(key_);
-	KJ_LOG(INFO, response.statusText);
 	auto headers = reply.initHeaders(response.headers->size());
 	auto ii = 0u;
 	response.headers->forEach(
@@ -358,7 +340,6 @@ kj::Promise<void> ObjectServer::head(HeadContext ctx) {
 	    auto header = headers[ii++].initUncommon();
 	    header.setName(name);
 	    header.setValue(value);
-	    KJ_LOG(INFO, name, value);
 	  }
 	);
       }
@@ -375,23 +356,28 @@ kj::Promise<void> ObjectServer::read(ReadContext ctx) {
   auto params = ctx.getParams();;
   auto first = params.getFirst();
   auto last = params.getLast();
-  auto out = bucket_->s3_->factory_->capnpToKj(params.getStream());
+  auto version = params.getVersion();
+  auto out = bucket_->s3_->factory_.capnpToKj(params.getStream());
 
-  auto url = kj::str("https://"_kj, bucket_->hostname_, '/', key_);
+  auto url = bucket_->url_.clone();
+  url.path.add(kj::str(key_));
+  if (version.size()) {
+    url.query.add(kj::str("versionId"_kj), kj::str(version));
+  }
+
   auto headers = bucket_->headers_.cloneShallow();
   headers.set(bucket_->s3_->ids_.range, kj::str(first, '-', last));
 				    
   auto req = bucket_->s3_->client_->request(
-    kj::HttpMethod::GET, url, headers, 0ul
+    kj::HttpMethod::GET, url.toString(), headers, 0ul
   );
 
   return
     req.response
     .then(
-      [this, ctx = kj::mv(ctx), out = kj::mv(out)](auto response) mutable {
-	tasks_.add(
-	  response.body->pumpTo(*out)
-	  .ignoreResult()
+      [this, out = kj::mv(out)](auto response) mutable {
+	bucket_->s3_->tasks_.add(
+	  response.body->pumpTo(*out).ignoreResult()
 	  .attach(kj::mv(response.body), kj::mv(out))
 	);
       }
@@ -401,16 +387,19 @@ kj::Promise<void> ObjectServer::read(ReadContext ctx) {
 kj::Promise<void> ObjectServer::write(WriteContext ctx) {
   auto params = ctx.getParams();
   auto length = params.getLength();
-  auto url = kj::str("https://"_kj, bucket_->hostname_, '/', key_);
+
+  auto url = bucket_->url_.clone();
+  url.path.add(kj::str(key_));
+
   auto headers = bucket_->headers_.cloneShallow();
   auto req = bucket_->s3_->client_->request(
-    kj::HttpMethod::PUT, url, headers, length
+    kj::HttpMethod::PUT, url.toString(), headers, length
   );
 
-  auto stream = bucket_->s3_->factory_->kjToCapnp(kj::mv(req.body));
+  auto stream = bucket_->s3_->factory_.kjToCapnp(kj::mv(req.body));
   auto reply = ctx.getResults();
   reply.setStream(kj::mv(stream));
-  tasks_.add(req.response.ignoreResult());
+  bucket_->s3_->tasks_.add(req.response.ignoreResult());
   return kj::READY_NOW;
 }
 
@@ -424,15 +413,6 @@ kj::Promise<void> ObjectServer::delete_(DeleteContext ctx) {
   return req.response.ignoreResult();
 }
 
-  /*
-
-<InitiateMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-<Bucket>vaci-bf</Bucket>
-<Key>d2229ad6-4a6d-41ef-8435-1e554e418e06</Key>
-<UploadId>OR61QsJLLojN88aArchMUxp_X5FXyvJaXoBmZY2EQxkue2nspflugORwm305reoI_EDugmidQa2u6KiwaptbTgn62SBaFurQB0un6YOSV9u4nKa1920Ia7RRXv5SVVHs</UploadId>
-</InitiateMultipartUploadResult>
-
-  */
 kj::Promise<void> ObjectServer::multipart(MultipartContext ctx) {
   auto url = kj::str("https://"_kj, bucket_->hostname_, '/', key_, "?uploads"_kj);
   auto headers = bucket_->headers_.cloneShallow();
@@ -448,7 +428,6 @@ kj::Promise<void> ObjectServer::multipart(MultipartContext ctx) {
     )
     .then(
       [this, ctx = kj::mv(ctx)](auto txt) mutable {
-	KJ_LOG(INFO, txt);
 	rapidxml::xml_document<> doc;
 	doc.parse<rapidxml::parse_non_destructive>(const_cast<char*>(txt.cStr()));
 
@@ -460,19 +439,11 @@ kj::Promise<void> ObjectServer::multipart(MultipartContext ctx) {
 
 	auto& result = KJ_REQUIRE_NONNULL(firstNode(doc, "InitiateMultipartUploadResult"_kj));
 	auto& uploadId = KJ_REQUIRE_NONNULL(firstNode(result, "UploadId"_kj));
+
 	auto reply = ctx.getResults();
-	reply.setStream(
-	  kj::heap<MultipartStream>(
-	    addRef(),
-	    kj::str(uploadId)
-	  )
-	 );
+	reply.setStream(kj::heap<MultipartStream>(addRef(), kj::str(uploadId)));
       }
     );
-}
-
-kj::Promise<void> ObjectServer::versions(VersionsContext ctx) {
-  return kj::READY_NOW;
 }
 
 MultipartStream::MultipartStream(
@@ -533,7 +504,6 @@ kj::Promise<void> MultipartStream::sendPart(
     req.body->write(buffer.begin(), buffer.size())
     .then(
       [req = kj::mv(req)]() mutable {
-	req.body = nullptr;
 	return kj::mv(req.response);
       }
     )
@@ -565,15 +535,14 @@ kj::Promise<kj::String> MultipartStream::complete() {
     "</CompleteMultipartUpload>"_kj
   ).flatten();
 
-  auto url = kj::str(
-    "https://", object_->bucket_->hostname_, "/", object_->key_,
-    "?uploadId=", uploadId_
-  );
+  auto url = object_->bucket_->url_.clone();
+  url.path.add(kj::str(object_->key_));
+  url.query.add(kj::str("uploadId"_kj), kj::str(uploadId_));
 
   auto headers = object_->bucket_->headers_.cloneShallow();
   headers.set(kj::HttpHeaderId::CONTENT_TYPE, "application/xml");
   auto req = object_->bucket_->s3_->client_->request(
-    kj::HttpMethod::POST, url, headers, txt.size()
+    kj::HttpMethod::POST, url.toString(), headers, txt.size()
   );
 
   return
@@ -639,7 +608,9 @@ aws::S3::Client newS3(
   auto proxy = kj::newHttpService(*client).attach(kj::mv(client));
   auto awsService = newAwsService(clock, *proxy, builder, credsProvider, "s3", region).attach(kj::mv(proxy));
   auto awsClient = kj::newHttpClient(*awsService).attach(kj::mv(awsService));
-  auto server = kj::refcounted<S3Server>(builder, kj::mv(credsProvider), kj::mv(awsClient), region);
+  auto factory = kj::heap<capnp::ByteStreamFactory>();
+
+  auto server = kj::refcounted<S3Server>(builder, kj::mv(credsProvider), kj::mv(awsClient), region, *factory).attach(kj::mv(factory));
   return server;
 }
 

@@ -1,27 +1,43 @@
 #include "creds.h"
 
+#include <kj/common.h>
+#include <kj/debug.h>
+
 #include <aws/core/auth/AWSCredentialsProviderChain.h>
+
+#include <stdlib.h>
 
 namespace aws {
 
 namespace {
 
+kj::Maybe<kj::StringPtr> getenv(kj::StringPtr name) {
+  auto value = ::getenv(name.cStr());
+  if (value) {
+    return kj::StringPtr{value};
+  }
+  else {
+    return {};
+  }
+}
+
 struct CredentialsProviderServer
   : Credentials::Provider::Server {
 
   kj::Promise<void> getCredentials(GetCredentialsContext ctx) {
-    // TODO a blocking call :/
-    auto awsCreds = credsProvider_->GetAWSCredentials();
     auto reply = ctx.getResults();
-    reply.setAccessKey(awsCreds.GetAWSAccessKeyId());
-    reply.setSecretKey(awsCreds.GetAWSSecretKey());
-    reply.setSessionToken(awsCreds.GetSessionToken());
+    KJ_IF_MAYBE(value, getenv("AWS_ACCESS_KEY_ID"_kj)) {
+      reply.setAccessKey(*value);
+    }
+    KJ_IF_MAYBE(value, getenv("AWS_SECRET_ACCESS_KEY"_kj)) {
+      reply.setSecretKey(*value);
+    }
+    KJ_IF_MAYBE(value, getenv("AWS_SESSION_TOKEN"_kj)) {
+      reply.setSessionToken(*value);
+    }
+    KJ_LOG(INFO, reply);
     return kj::READY_NOW;
   }
-
-  std::shared_ptr<Aws::Auth::DefaultAWSCredentialsProviderChain> credsProvider_{
-     std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>()
-  };
 };
 
 }

@@ -35,6 +35,7 @@
 
 #include <chrono>
 
+
 using namespace aws;
 
 static int EKAM_TEST_DISABLE_INTERCEPTOR = 1;
@@ -77,6 +78,23 @@ kj::Date toDate(std::tm& tm) {
   return kj::UNIX_EPOCH + (t * kj::SECONDS);
 }
 
+struct DefaultCredsServer
+  : Credentials::Provider::Server {
+
+  kj::Promise<void> getCredentials(GetCredentialsContext ctx) {
+    auto reply = ctx.getResults();
+    auto awsCreds = credsProvider_->GetAWSCredentials();
+    reply.setAccessKey(awsCreds.GetAWSAccessKeyId());
+    reply.setSecretKey(awsCreds.GetAWSSecretKey());
+    reply.setSessionToken(awsCreds.GetSessionToken());
+    return kj::READY_NOW;
+  }
+
+  std::shared_ptr<Aws::Auth::DefaultAWSCredentialsProviderChain> credsProvider_{
+    std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>()
+  };
+};
+
 Aws::Http::HeaderValueCollection convert(kj::HttpHeaders headers) {
   Aws::Http::HeaderValueCollection result;
   headers.forEach([&](auto name, auto value) {
@@ -90,7 +108,6 @@ struct S3Test
   
   S3Test() {
     credsProvider_ = std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>();
-    
   }
 
   ~S3Test() noexcept {
@@ -125,23 +142,23 @@ struct ListCallbackServer
 TEST_F(S3Test, ListBuckets) {
   auto service = "s3"_kj;
   auto region = "eu-west-1"_kj;
-  auto creds = ::aws::newCredentialsProvider();
+  auto creds = kj::heap<DefaultCredsServer>();
   
   kj::HttpHeaderTable::Builder builder;
 
   auto client = kj::newHttpClient(timer_, builder.getFutureTable(), network_, *tlsNetwork_);
-  auto s3 = newS3(kj::systemPreciseCalendarClock(), timer_, network_, *tlsNetwork_, builder, creds, "eu-west-1"_kj);
+  auto s3 = newS3(kj::systemPreciseCalendarClock(), timer_, network_, *tlsNetwork_, builder, kj::mv(creds), "eu-west-1"_kj);
   auto headerTable = builder.build();
 
-  auto req = s3.listRequest();
-  req.setCallback(kj::heap<ListCallbackServer>());
-  req.send().wait(waitScope_);
+  auto req = s3.listBucketsRequest();
+  auto reply = req.send().wait(waitScope_);
+  KJ_LOG(INFO, reply);
 }
 
 TEST_F(S3Test, GetObject) {
   auto service = "s3"_kj;
   auto region = "eu-west-1"_kj;
-  auto creds = ::aws::newCredentialsProvider();
+  auto creds = kj::heap<DefaultCredsServer>();
   
   kj::HttpHeaderTable::Builder builder;
 
@@ -183,7 +200,7 @@ TEST_F(S3Test, GetObject) {
 TEST_F(S3Test, PutObject) {
   auto service = "s3"_kj;
   auto region = "eu-west-1"_kj;
-  auto creds = ::aws::newCredentialsProvider();
+  auto creds = kj::heap<DefaultCredsServer>();
 
   kj::HttpHeaderTable::Builder builder;
 
@@ -253,7 +270,7 @@ TEST_F(S3Test, PutObject) {
 TEST_F(S3Test, PutMultipartObject) {
   auto service = "s3"_kj;
   auto region = "eu-west-1"_kj;
-  auto creds = ::aws::newCredentialsProvider();
+  auto creds = kj::heap<DefaultCredsServer>();
 
   kj::HttpHeaderTable::Builder builder;
 
@@ -272,7 +289,6 @@ TEST_F(S3Test, PutMultipartObject) {
     return req.send().getObject();
   }();
 
-  KJ_LOG(INFO, "WRITING...");
   {
     auto content = uuid();
     auto bytes = content.asBytes();
@@ -291,8 +307,6 @@ TEST_F(S3Test, PutMultipartObject) {
       req.send().wait(waitScope_);
     }
   }
-
-  KJ_LOG(INFO, "READING...");
   {
     auto pipe = kj::newOneWayPipe();
     capnp::ByteStreamFactory factory;
@@ -312,7 +326,6 @@ TEST_F(S3Test, PutMultipartObject) {
     KJ_LOG(INFO, reply);
   }
 }
-
 
 TEST_F(S3Test, BasicHttp) {
   

@@ -32,6 +32,7 @@ pkgs.stdenv.mkDerivation {
 
   buildInputs = with pkgs; [
     aws-sdk-cpp
+    boost.dev
     capnproto
     dbus
     libuuid
@@ -46,6 +47,7 @@ pkgs.stdenv.mkDerivation {
     clang-tools
     ekam
     gtest
+    minio
     which
   ];
 
@@ -62,10 +64,6 @@ pkgs.stdenv.mkDerivation {
     ${create-ekam-rules-link}
     make ${if debug then "debug" else "release"}
   '';
-
-  # Pointless for static libraries, but uncomment if we ever move to a shared
-  # object
-  #separateDebugInfo = true;
 
   installPhase = ''
     install --verbose -D --mode=644 \

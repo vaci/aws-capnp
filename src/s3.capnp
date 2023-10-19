@@ -19,23 +19,42 @@ struct Credentials {
   }
 }
 
+interface SecurityToken {
+  assumeRole @0 (
+    roleArn :Text,
+    roleSessionName: Text
+  ) -> (
+    sessionToken :Text,
+    secretKey :Text,
+    expiration :Text
+  );
+}
+
 interface Callback(T) {
   next @0 (value :T);
   end @1 ();
 }
 
 interface S3 {
-  list @0 (callback :Callback(Text));
+  listBuckets @0 () -> (bucketNames: List(Text));
   getBucket @1 (name :Text) -> (bucket :Bucket);
+  createBucket @2 (name :Text) -> (bucket :Bucket);
 
   interface Bucket {
     struct Properties {
       name @0 :Text;
     }
 
+    struct ObjectVersion {
+      key @0 :Text;
+      version @1 :Text;
+      deleted @2 :Bool;
+    }
+
     head @0 () -> Properties;
-    list @1 (prefix :Text = "", callback: Callback(Text));
-    getObject @2 (key :Text) -> (object :Object);
+    listObjects @1 (prefix :Text = "", callback: Callback(Text));
+    listObjectVersions @2 (prefix :Text = "", callback: Callback(ObjectVersion));
+    getObject @3 (key :Text) -> (object :Object);
   }
 
   interface Object {
@@ -43,19 +62,18 @@ interface S3 {
       key @0 :Text;
       headers @1 :List(HttpHeader);
     }
-    head @0 () -> Properties;
+    head @0 (version :Text = "") -> Properties;
     getBucket @1 () -> (bucket :Bucket);
 
     read @2 (
       stream :ByteStream,
       first :UInt64 = 0,
-      last :UInt64 = 0xFFFFFFFF);
+      last :UInt64 = 0xFFFFFFFF,
+      version :Text = ""
+    );
     write @3 (length :UInt64) -> (stream :ByteStream);
     multipart @4 () -> (stream :ByteStream);
-
-    versions @5 (callback: Callback(Text));
-
-    delete @6 ();
+    delete @5 (version :Text = "");
   }
 }
 
