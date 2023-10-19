@@ -15,8 +15,27 @@ namespace aws {
 
 namespace {
 
-struct HttpService
+struct HttpServiceBase
   : kj::HttpService {
+
+  HttpServiceBase(kj::HttpHeaderTable::Builder&, S3::Client);
+
+  kj::HttpHeaderTable& table_;
+  S3::Client s3_;
+};
+
+struct ListBucketsService
+  : HttpServiceBase {
+
+  ListBucketsService(kj::HttpHeaderTable::Builder&, S3::Client);
+
+  kj::Promise<void> request(
+    kj::HttpMethod, kj::StringPtr url, const kj::HttpHeaders&,
+    kj::AsyncInputStream&, Response&) override;
+};
+
+struct HttpService
+  : HttpServiceBase {
 
   HttpService(kj::HttpHeaderTable::Builder&, S3::Client);
 
@@ -34,9 +53,10 @@ struct HttpService
     kj::HttpHeaderId xAmzSecurityToken;
   } ids_;
 
-  kj::HttpHeaderTable& table_;
-  S3::Client s3_;
+  kj::Own<ListBucketsService> listBuckets_;
 };
+
+
 
 struct S3ServerImpl
   : S3::Server
@@ -105,9 +125,14 @@ struct ObjectServerImpl
   kj::String hex_;
 };
 
+HttpServiceBase::HttpServiceBase(kj::HttpHeaderTable::Builder& builder, S3::Client s3)
+  : table_{builder.getFutureTable()}
+  , s3_{kj::mv(s3)} {
+}
 
 HttpService::HttpService(kj::HttpHeaderTable::Builder& builder, S3::Client s3)
-  : ids_{
+  : HttpServiceBase{builder, s3}
+  , ids_{
       .accept{builder.add("accept")},
       .amzSdkInvocationId{builder.add("amz-sdk-invocation-id")},
       .amzSdkRequest{builder.add("amz-sdk-request")},
@@ -115,26 +140,9 @@ HttpService::HttpService(kj::HttpHeaderTable::Builder& builder, S3::Client s3)
       .xAmzContentSha256{builder.add("x-amz-content-sha256")},
       .xAmzDate{builder.add("x-amz-date")},
       .xAmzSecurityToken{builder.add("X-Amz-Security-Token")}
-  },
-  table_{builder.getFutureTable()},
-  s3_{kj::mv(s3)} {
+  }
+  , listBuckets_{kj::heap<ListBucketsService>(builder, s3)} {
 }
-
-/*
-  <?xml version="1.0" encoding="UTF-8"?>
-<ListAllMyBucketsResult>
-   <Buckets>
-      <Bucket>
-         <CreationDate>timestamp</CreationDate>
-         <Name>string</Name>
-      </Bucket>
-   </Buckets>
-   <Owner>
-      <DisplayName>string</DisplayName>
-      <ID>string</ID>
-   </Owner>
-</ListAllMyBucketsResult>
-*/
 
 kj::Promise<void> HttpService::request(
   kj::HttpMethod method, kj::StringPtr urlTxt, const kj::HttpHeaders& headers,
@@ -145,34 +153,41 @@ kj::Promise<void> HttpService::request(
 
   if (method == kj::HttpMethod::GET && url.path.size() == 0 && host == "s3.amazonaws.com") {
     // ListBuckets
-
-    auto req = s3_.listBucketsRequest();
-    return
-      req.send().then(
-	[&](auto reply) {
-	  auto names = reply.getBucketNames();
-	  auto txt = kj::strTree(
-	    R"(<?xml version="1.0" encoding="UTF-8"?>)"_kj,
-	    "<ListAllMyBucketsResult><Buckets>"_kj,
-	    KJ_MAP(name, names) {
-	      return kj::strTree(
-		"<Bucket>"_kj,
-		"<Name>"_kj, name, "</Name>"_kj,
-		"<CreationDate>2019-12-11T23:32:47+00:00</CreationDate>"_kj,
-		"<Bucket>"_kj
-	      );
-	    },
-	    "</Buckets></ListAllMyBucketsResult>"_kj
-	  ).flatten();
-
-	  kj::HttpHeaders headers{table_};
-	  auto body = response.send(200, "OK"_kj, headers, txt.size()); 
-	  return body->write(txt.begin(), txt.size()).attach(kj::mv(body));
-	}
-      );
+    return listBuckets_->request(method, urlTxt, headers, body, response);
   }
   
   return kj::READY_NOW;
+}
+
+kj::Promise<void> ListBucketsService::request(
+  kj::HttpMethod, kj::StringPtr, const kj::HttpHeaders&,
+  kj::AsyncInputStream&, Response& response) {
+
+  auto req = s3_.listBucketsRequest();
+  return
+    req.send()
+    .then(
+      [&](auto reply) {
+	auto names = reply.getBucketNames();
+	auto txt = kj::strTree(
+	  R"(<?xml version="1.0" encoding="UTF-8"?>)"_kj,
+	  "<ListAllMyBucketsResult><Buckets>"_kj,
+	  KJ_MAP(name, names) {
+	    return kj::strTree(
+	      "<Bucket>"_kj,
+	      "<Name>"_kj, name, "</Name>"_kj,
+	      "<CreationDate>2019-12-11T23:32:47+00:00</CreationDate>"_kj,
+	      "<Bucket>"_kj
+	    );
+	  },
+	  "</Buckets></ListAllMyBucketsResult>"_kj
+	).flatten();
+
+	kj::HttpHeaders headers{table_};
+	auto body = response.send(200, "OK"_kj, headers, txt.size()); 
+	return body->write(txt.begin(), txt.size()).attach(kj::mv(body));
+      }
+    );
 }
 
 kj::Promise<void> BucketServerImpl::listObjects(ListObjectsContext ctx) {

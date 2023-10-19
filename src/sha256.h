@@ -20,10 +20,6 @@ struct Sha256 {
   virtual void update(kj::ArrayPtr<const uint8_t>) = 0;
   virtual kj::Array<uint8_t> digest() = 0;
 
-  void update(const char* txt) {
-    update(kj::StringPtr{txt}.asBytes());
-  }
-
   void update(kj::StringPtr txt) {
     update(txt.asBytes());
   }

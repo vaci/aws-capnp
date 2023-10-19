@@ -80,7 +80,7 @@ AwsService::AwsService(
   , credsProvider_{kj::mv(credsProvider)}
   , service_{service}
   , region_{region}
-  , scope_{kj::str("/"_kj, region_, "/"_kj, service_, "/aws4_request"_kj)} {
+  , scope_{kj::str('/', region_, '/', service_, "/aws4_request"_kj)} {
 }
 
 kj::Promise<void> AwsService::request(
@@ -113,7 +113,6 @@ kj::Promise<void> AwsService::request(
 	headers.set(ids_.amzSdkRequest, "attempt=1");
 	headers.set(ids_.xAmzDate, ds);
 	headers.set(ids_.xAmzContentSha256, contentHash);
-
 	{
 	  auto sessionToken = creds.getSessionToken();
 	  if (sessionToken.size()) {

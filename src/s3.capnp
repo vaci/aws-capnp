@@ -8,6 +8,7 @@ $import "/capnp/c++.capnp".namespace("aws");
 
 using ByteStream =  import "/capnp/compat/byte-stream.capnp".ByteStream;
 using HttpHeader =  import "/capnp/compat/http-over-capnp.capnp".HttpHeader;
+using Version = Text;
 
 struct Credentials {
   accessKey @0 :Text;
@@ -47,7 +48,7 @@ interface S3 {
 
     struct ObjectVersion {
       key @0 :Text;
-      version @1 :Text;
+      version @1 :Version;
       deleted @2 :Bool;
     }
 
@@ -62,18 +63,18 @@ interface S3 {
       key @0 :Text;
       headers @1 :List(HttpHeader);
     }
-    head @0 (version :Text = "") -> Properties;
+    head @0 (version :Version = "") -> Properties;
     getBucket @1 () -> (bucket :Bucket);
 
     read @2 (
       stream :ByteStream,
       first :UInt64 = 0,
       last :UInt64 = 0xFFFFFFFF,
-      version :Text = ""
+      version :Version = ""
     );
     write @3 (length :UInt64) -> (stream :ByteStream);
     multipart @4 () -> (stream :ByteStream);
-    delete @5 (version :Text = "");
+    delete @5 (version :Version = "");
   }
 }
 
