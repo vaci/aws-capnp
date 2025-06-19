@@ -466,7 +466,7 @@ kj::Promise<void> MultipartStream::write(kj::ArrayPtr<kj::byte const> bytes) {
   auto remaining = buffer_.size() - out_->getArray().size();
   KJ_DREQUIRE(remaining);
 
-  if (remaining <= bytes.size()) {
+  if (remaining < bytes.size()) {
     return write(bytes.slice(0, remaining))
       .then(
           [this, remaining, bytes]{
